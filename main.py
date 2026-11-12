@@ -684,11 +684,79 @@ def forecast(task, marks, seed=SEED):
     return {"probabilities": rows, "top5": top5, "sizes": sizes}, sim["info"]
 
 
+def history_mints(marks):
+    seen = []
+    known = set()
+    for _, rows in marks:
+        for r in rows:
+            m = r.get("mint") if isinstance(r, dict) else None
+            if isinstance(m, str) and m and m not in known:
+                known.add(m)
+                seen.append(m)
+    return seen
+
+
+def fallback(task, marks):
+    """Persistence with wide sizes, for when the model fails: the last non-empty mark's order holds."""
+    places = int(task.get("places") or 5)
+    nb = len((task.get("size") or {}).get("edges") or [0] * 81) + 1
+    last = []
+    for _, rows in reversed(marks):
+        good = [r for r in rows if isinstance(r, dict) and isinstance(r.get("mint"), str) and r["mint"]
+                and log_cap(r.get("market_cap_lamports")) is not None]
+        if good:
+            last = sorted(good, key=lambda r: (-log_cap(r["market_cap_lamports"]), r["mint"]))
+            break
+    probs = [{"mint": last[k]["mint"], "place": k + 1, "p": 0.2} for k in range(min(places, len(last)))]
+    sizes = [{"place": k + 1, "bin": b, "p": floor6(1.0 / nb)} for k in range(places) for b in range(nb)]
+    return {"probabilities": probs, "top5": [], "sizes": sizes}
+
+
+def sanitize(out, task, marks):
+    """Enforce every limit of the forecast's shape, whatever produced it."""
+    places = int(task.get("places") or 5)
+    nb = len((task.get("size") or {}).get("edges") or [0] * 81) + 1
+    hist = history_mints(marks)
+    known = set(hist)
+    probs, per = [], {}
+    for r in sorted(out.get("probabilities", []), key=lambda r: (r["place"], -r["p"], r["mint"])):
+        k, m, p = int(r["place"]), str(r["mint"]), float(r["p"])
+        if not (1 <= k <= places) or m not in known or not (32 <= len(m) <= 44) or not (p > 0) or p > 1:
+            continue
+        seen = per.setdefault(k, {})
+        if m in seen or len(seen) >= MAX_ROWS or sum(seen.values()) + p > 1.0 - 1e-9:
+            continue
+        seen[m] = p
+        probs.append({"mint": m, "place": k, "p": p})
+    sizes, per_b = [], {}
+    for r in sorted(out.get("sizes", []), key=lambda r: (r["place"], r["bin"])):
+        k, b, p = int(r["place"]), int(r["bin"]), float(r["p"])
+        if not (1 <= k <= places) or not (0 <= b < nb) or not (p > 0) or p > 1:
+            continue
+        seen = per_b.setdefault(k, {})
+        if b in seen or sum(seen.values()) + p > 1.0 - 1e-9:
+            continue
+        seen[b] = p
+        sizes.append({"place": k, "bin": b, "p": p})
+    top5 = []
+    fill = list(out.get("top5", [])) + [r["mint"] for r in probs] + hist + PLACEHOLDERS
+    for m in fill:
+        if len(top5) >= 5:
+            break
+        if isinstance(m, str) and 32 <= len(m) <= 44 and m not in top5:
+            top5.append(m)
+    return {"probabilities": probs, "top5": top5, "sizes": sizes}
+
+
 def main():
     input_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
     output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
     task, marks = load(input_dir)
-    out, info = forecast(task, marks)
+    try:
+        out, info = forecast(task, marks)
+    except Exception as e:        # never leave the run without a forecast: it would score the floor everywhere
+        out, info = fallback(task, marks), {"error": repr(e)}
+    out = sanitize(out, task, marks)
     name = task.get("output") or "forecast.json"
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, name), "w", encoding="utf-8") as f:

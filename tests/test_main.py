@@ -158,6 +158,30 @@ class TestRobustness(unittest.TestCase, Validate):
         self.check(out, {r["mint"] for r in rows})
 
 
+class TestGuards(unittest.TestCase, Validate):
+    def test_fallback_is_valid(self):
+        rows = [row(i + 1, mint_of(i), 900 / (i + 1)) for i in range(8)]
+        marks = [(0.0, rows)]
+        out = main.sanitize(main.fallback(make_task(), marks), make_task(), marks)
+        self.check(out, {r["mint"] for r in rows})
+
+    def test_sanitize_enforces_limits(self):
+        rows = [row(i + 1, mint_of(i), 900 / (i + 1)) for i in range(150)]
+        marks = [(0.0, rows)]
+        bad = {"probabilities": [{"mint": mint_of(i), "place": 1, "p": 0.009} for i in range(150)]
+               + [{"mint": "U" * 44, "place": 2, "p": 0.5}, {"mint": mint_of(1), "place": 9, "p": 0.5},
+                  {"mint": mint_of(2), "place": 3, "p": 0.7}, {"mint": mint_of(3), "place": 3, "p": 0.7}],
+               "top5": [mint_of(1), mint_of(1)],
+               "sizes": [{"place": 1, "bin": 90, "p": 0.5}, {"place": 1, "bin": 3, "p": 0.6},
+                         {"place": 1, "bin": 4, "p": 0.6}]}
+        out = main.sanitize(bad, make_task(), marks)
+        self.assertEqual(sum(1 for r in out["probabilities"] if r["place"] == 1), 100)
+        self.assertFalse(any(r["place"] == 2 for r in out["probabilities"]))
+        self.assertEqual(sum(1 for r in out["probabilities"] if r["place"] == 3), 1)
+        self.assertEqual(len(out["sizes"]), 1)
+        self.assertEqual(len(set(out["top5"])), 5)
+
+
 class TestSyntheticFinalShape(unittest.TestCase, Validate):
     def test_synthetic_runs_fast_and_valid(self):
         with tempfile.TemporaryDirectory() as d:
